@@ -1,0 +1,12 @@
+The user recorded a Scrawl capture on their Mac and it was sent to this server. Treat it as their message: they are showing you a problem or an idea instead of typing it out.
+
+Capture folder (on this server): {path}
+Contact sheet: {contact_sheet}
+Keyframes folder: {frames_dir} (files: {frames})
+Full uncropped frames available: {has_full_frames}
+
+Summary and transcript from Scrawl:
+
+{summary}
+
+Look at the contact sheet first with vision_analyze, then open the keyframes the narration points at (frames/frame-NN.png is keyframe #NN). Trust the screen over the transcript when they disagree. Then reply to them: say in one line what they are showing, then what you see at the key moments (cite them as #N (M:SS)), and what you would do about it. Don't take any action beyond the reply. End with the capture folder path on its own line so a follow-up can open it.

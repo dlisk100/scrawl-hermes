@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Receive one Scrawl capture over SSH and tell Hermes about it.
+
+Runs as an SSH forced command (see README). The client sends
+`receive <bundle-name>` with a tar of the capture on stdin; `ping` checks the link.
+The capture is unpacked into a staging folder, checked, and moved into the inbox
+in one rename, so Hermes never sees half a capture. Then a signed webhook is sent
+to the local Hermes gateway. Sending the same capture again is safe: an unpacked
+capture is not unpacked twice, and a failed notification is retried.
+
+Prints one JSON line: {"ok": bool, "bundle": str, "notified": bool, ...}.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+INBOX = Path(os.environ.get("SCRAWL_HERMES_INBOX", str(Path.home() / "scrawl-inbox")))
+WEBHOOK_URL = os.environ.get("SCRAWL_HERMES_WEBHOOK_URL", "http://127.0.0.1:8644/webhooks/scrawl")
+SECRET_FILE = Path(os.environ.get(
+    "SCRAWL_HERMES_SECRET_FILE", str(Path.home() / ".config/scrawl-hermes/webhook.secret")))
+MAX_BYTES = int(os.environ.get("SCRAWL_HERMES_MAX_BYTES", str(1024 * 1024 * 1024)))  # 1 GiB
+MAX_MEMBERS = 5000
+KEEP_DAYS = int(os.environ.get("SCRAWL_HERMES_KEEP_DAYS", "14"))
+SUMMARY_LIMIT = 12000
+REQUIRED = ("summary.md", "scrawl.json", "contact-sheet.png")
+NAME_RE = re.compile(r"^scrawl-[0-9]{10,16}-[0-9a-f]{1,8}(-[0-9]{1,6})?$")
+COMPLETE = ".received"
+NOTIFIED = ".notified"
+
+
+class TooBig(Exception):
+    pass
+
+
+class LimitedReader:
+    """File-like wrapper that refuses to read past a byte cap."""
+
+    def __init__(self, raw, limit):
+        self.raw, self.limit, self.count = raw, limit, 0
+
+    def read(self, n=-1):
+        chunk = self.raw.read(n if n is not None and n >= 0 else 1 << 20)
+        self.count += len(chunk)
+        if self.count > self.limit:
+            raise TooBig(f"capture is larger than {self.limit} bytes")
+        return chunk
+
+
+def reply(**fields):
+    print(json.dumps(fields), flush=True)
+    return 0 if fields.get("ok") else 1
+
+
+def drain(stream):
+    while stream.read(1 << 20):
+        pass
+
+
+def unpack(name, stream):
+    dest = INBOX / name
+    if (dest / COMPLETE).exists():
+        drain(stream)
+        return dest, True
+    staging = INBOX / ".staging" / f"{name}.{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, mode=0o700)
+    try:
+        members = 0
+        with tarfile.open(fileobj=LimitedReader(stream, MAX_BYTES), mode="r|") as tar:
+            for member in tar:
+                members += 1
+                if members > MAX_MEMBERS:
+                    raise ValueError("too many files in capture")
+                if not (member.isfile() or member.isdir()):
+                    continue  # no links, devices or fifos
+                tar.extract(member, staging, filter="data")
+        missing = [f for f in REQUIRED if not (staging / f).is_file()]
+        if missing:
+            raise ValueError("capture is missing " + ", ".join(missing))
+        (staging / COMPLETE).write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z\n"))
+        if dest.exists():  # an older, incomplete attempt
+            shutil.rmtree(dest)
+        os.rename(staging, dest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            staging.parent.rmdir()  # only succeeds when no other upload is in flight
+        except OSError:
+            pass
+    return dest, False
+
+
+def payload_for(name, dest):
+    summary = (dest / "summary.md").read_text(errors="replace")
+    if len(summary) > SUMMARY_LIMIT:
+        summary = summary[:SUMMARY_LIMIT] + "\n[summary cut; full text in summary.md]"
+    frames = sorted(p.name for p in (dest / "frames").glob("*.png")) if (dest / "frames").is_dir() else []
+    return {
+        "event_type": "scrawl.capture",
+        "bundle": name,
+        "path": str(dest),
+        "contact_sheet": str(dest / "contact-sheet.png"),
+        "frames_dir": str(dest / "frames"),
+        "frames": ", ".join(frames) or "(none)",
+        "has_full_frames": (dest / "frames-full").is_dir(),
+        "has_video": any(dest.glob("recording.*")),
+        "summary": summary,
+    }
+
+
+def notify(name, dest):
+    if (dest / NOTIFIED).exists():
+        return True, "already notified"
+    secret = SECRET_FILE.read_text().strip()
+    body = json.dumps(payload_for(name, dest)).encode()
+    stamp = str(int(time.time()))
+    signature = hmac.new(secret.encode(), stamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+    request = urllib.request.Request(WEBHOOK_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "X-Webhook-Timestamp": stamp,
+        "X-Webhook-Signature-V2": signature,
+        "X-Request-ID": f"scrawl:{name}",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status = response.status
+            text = response.read(2000).decode(errors="replace")
+    except urllib.error.HTTPError as err:
+        status, text = err.code, err.read(2000).decode(errors="replace")
+    except OSError as err:
+        return False, f"webhook unreachable: {err}"
+    if status in (200, 202):  # 200 also covers "duplicate": Hermes already has it
+        (dest / NOTIFIED).write_text(text + "\n")
+        return True, text
+    return False, f"webhook answered {status}: {text}"
+
+
+def prune():
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for path in INBOX.glob("scrawl-*"):
+        marker = path / COMPLETE
+        if marker.exists() and marker.stat().st_mtime < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def main(argv):
+    command = os.environ.get("SSH_ORIGINAL_COMMAND") or " ".join(argv[1:])
+    parts = command.split()
+    if parts[:1] == ["ping"]:
+        return reply(ok=True, pong=True, inbox=str(INBOX))
+    if len(parts) != 2 or parts[0] != "receive":
+        return reply(ok=False, error="usage: receive <bundle-name> | ping")
+    name = parts[1].removesuffix(".scrawl")
+    if not NAME_RE.match(name):
+        return reply(ok=False, error="not a Scrawl bundle name")
+    INBOX.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        dest, duplicate = unpack(name, sys.stdin.buffer)
+    except (TooBig, ValueError, tarfile.TarError, OSError) as err:
+        return reply(ok=False, bundle=name, error=str(err))
+    notified, detail = notify(name, dest)
+    prune()
+    return reply(ok=True, bundle=name, path=str(dest), duplicate=duplicate, notified=notified, detail=detail)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

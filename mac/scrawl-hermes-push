@@ -1,0 +1,99 @@
+#!/bin/bash
+# Send finished Scrawl captures to a Hermes server over SSH.
+# launchd runs this when the captures folder changes and once a minute.
+# A capture counts as sent only after the server confirms Hermes was told about it,
+# so anything that fails is tried again on the next run.
+set -u
+
+CONF="${SCRAWL_HERMES_CONFIG:-$HOME/.config/scrawl-hermes/config}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+CAPTURES="${SCRAWL_CAPTURES_DIR:-$HOME/Library/Application Support/scrawl/captures}"
+STATE="${SCRAWL_HERMES_STATE:-$HOME/Library/Application Support/scrawl-hermes}"
+REMOTE="${SCRAWL_HERMES_REMOTE:-}"
+KEY="${SCRAWL_HERMES_KEY:-$HOME/.ssh/scrawl_hermes}"
+KNOWN_HOSTS="${SCRAWL_HERMES_KNOWN_HOSTS:-$HOME/.config/scrawl-hermes/known_hosts}"
+SSH_PORT="${SCRAWL_HERMES_SSH_PORT:-22}"
+INCLUDE_VIDEO="${SCRAWL_HERMES_INCLUDE_VIDEO:-0}"
+SETTLE_SECONDS="${SCRAWL_HERMES_SETTLE_SECONDS:-3}"
+WAIT_SECONDS="${SCRAWL_HERMES_WAIT_SECONDS:-120}"
+
+mkdir -p "$STATE/sent"
+LOG="$STATE/push.log"
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+if [ -z "$REMOTE" ]; then
+  log "SCRAWL_HERMES_REMOTE is not set in $CONF"
+  exit 1
+fi
+
+if [ "$(uname)" = Darwin ]; then
+  mtime() { stat -f %m "$1"; }
+else
+  mtime() { stat -c %Y "$1"; }  # GNU stat, for tests on Linux
+fi
+
+# One run at a time. A lock older than 10 minutes is left over from a crash.
+LOCK="$STATE/lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ $(( $(date +%s) - $(mtime "$LOCK") )) -gt 600 ]; then
+    rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rm -rf "$LOCK"' EXIT
+
+ssh_remote() {
+  ssh -i "$KEY" -p "$SSH_PORT" \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+    "$REMOTE" "$@"
+}
+
+if [ "${1:-}" = "--check" ]; then
+  ssh_remote ping
+  exit $?
+fi
+
+send_bundle() {
+  local bundle="$1" name="$2" files=() f out
+  for f in summary.md scrawl.json contact-sheet.png frames frames-full routing.json; do
+    [ -e "$bundle/$f" ] && files+=("$f")
+  done
+  if [ "$INCLUDE_VIDEO" = 1 ]; then
+    for f in "$bundle"/recording.* "$bundle"/audio.wav; do
+      [ -f "$f" ] && files+=("$(basename "$f")")
+    done
+  fi
+  out=$(tar -C "$bundle" -cf - "${files[@]}" | ssh_remote receive "$name" 2>&1)
+  if printf '%s' "$out" | grep -q '"notified": true'; then
+    : > "$STATE/sent/$name"
+    log "sent $name"
+  else
+    log "not sent yet $name: $out"
+  fi
+}
+
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
+while :; do
+  waiting=0
+  now=$(date +%s)
+  for bundle in "$CAPTURES"/scrawl-*.scrawl; do
+    [ -d "$bundle" ] || continue
+    name=$(basename "$bundle" .scrawl)
+    [ -e "$STATE/sent/$name" ] && continue
+    if [ -f "$bundle/summary.md" ] && [ -f "$bundle/scrawl.json" ] && [ -f "$bundle/contact-sheet.png" ]; then
+      if [ $(( now - $(mtime "$bundle/summary.md") )) -ge "$SETTLE_SECONDS" ]; then
+        send_bundle "$bundle" "$name"
+      else
+        waiting=1
+      fi
+    elif [ $(( now - $(mtime "$bundle") )) -lt 300 ]; then
+      waiting=1  # Scrawl is still building this one
+    fi
+  done
+  [ "$waiting" = 1 ] && [ "$(date +%s)" -lt "$deadline" ] || break
+  sleep 2
+done

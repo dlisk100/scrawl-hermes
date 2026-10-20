@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RECEIVER="$HERE/scrawl-hermes-receive"
 CONF_DIR="$HOME/.config/scrawl-hermes"
 SECRET_FILE="$CONF_DIR/webhook.secret"
-inbox="$HOME/scrawl-inbox" deliver="" chat_id="" allow_key=""
+inbox="" deliver="" chat_id="" allow_key=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -24,7 +24,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-mkdir -p "$CONF_DIR" "$inbox"
+mkdir -p "$CONF_DIR"
+# Remember the inbox so a later --allow-key run points the SSH key at the same folder.
+if [ -n "$inbox" ]; then printf '%s\n' "$inbox" > "$CONF_DIR/inbox"
+elif [ -s "$CONF_DIR/inbox" ]; then inbox="$(cat "$CONF_DIR/inbox")"
+else inbox="$HOME/scrawl-inbox"; fi
+mkdir -p "$inbox"
 chmod 700 "$CONF_DIR" "$inbox"
 chmod 755 "$RECEIVER"
 

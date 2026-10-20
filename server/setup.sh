@@ -4,7 +4,9 @@
 #   server/setup.sh                       # create secret + webhook route; print next steps
 #   server/setup.sh --allow-key "ssh-ed25519 AAAA... scrawl-hermes mac"   # authorize a Mac
 #
-# Options: --deliver discord --chat-id <channel id>   where Hermes posts its read of each capture
+# Options: --deliver discord --chat-id <channel id>   post every read to one fixed channel
+#          --deliver discord --follow                 post to the chat you used last (thread or
+#                                                     channel), else the home channel
 #          --inbox <dir>                               where captures are unpacked (default ~/scrawl-inbox)
 set -euo pipefail
 
@@ -12,13 +14,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RECEIVER="$HERE/scrawl-hermes-receive"
 CONF_DIR="$HOME/.config/scrawl-hermes"
 SECRET_FILE="$CONF_DIR/webhook.secret"
-inbox="" deliver="" chat_id="" allow_key=""
+inbox="" deliver="" chat_id="" follow=0 allow_key=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --inbox) inbox="$2"; shift 2 ;;
     --deliver) deliver="$2"; shift 2 ;;
     --chat-id) chat_id="$2"; shift 2 ;;
+    --follow) follow=1; shift ;;
     --allow-key) allow_key="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -57,7 +60,15 @@ PROMPT_FILE="$HERE/prompt.txt"
 args=(scrawl --events scrawl.capture --skills scrawl --secret "$(cat "$SECRET_FILE")"
       --description "Scrawl captures sent from a Mac" --prompt "$(cat "$PROMPT_FILE")")
 [ -n "$deliver" ] && args+=(--deliver "$deliver")
-[ -n "$chat_id" ] && args+=(--deliver-chat-id "$chat_id")
+if [ "$follow" = 1 ]; then
+  # Hermes only runs route scripts from its own scripts folder.
+  scripts="${HERMES_HOME:-$HOME/.hermes}/scripts"
+  mkdir -p "$scripts"
+  install -m 755 "$HERE/scrawl-follow.py" "$scripts/scrawl-follow.py"
+  args+=(--script scrawl-follow.py --deliver-chat-id "{target_chat_id}")
+elif [ -n "$chat_id" ]; then
+  args+=(--deliver-chat-id "$chat_id")
+fi
 hermes webhook subscribe "${args[@]}" >/dev/null
 echo "Webhook route 'scrawl' is set (secret in $SECRET_FILE)."
 echo "Host key for the Mac installer:"

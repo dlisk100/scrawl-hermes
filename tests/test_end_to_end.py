@@ -79,8 +79,21 @@ class StandIn(http.server.BaseHTTPRequestHandler):
 
 
 def start_webhook(tmp):
-    os.environ["HERMES_HOME"] = str(tmp / "hermes-home")
-    (tmp / "hermes-home").mkdir()
+    hermes_home = tmp / "hermes-home"
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    (hermes_home / "scripts").mkdir(parents=True)
+    shutil.copy(ROOT / "server" / "scrawl-follow.py", hermes_home / "scripts" / "scrawl-follow.py")
+    import sqlite3
+    db = sqlite3.connect(hermes_home / "state.db")
+    db.executescript("""CREATE TABLE sessions (id TEXT, source TEXT, chat_id TEXT);
+        CREATE TABLE messages (session_id TEXT, role TEXT, timestamp REAL);""")
+    db.executemany("INSERT INTO sessions VALUES (?,?,?)",
+                   [("a", "discord", "111"), ("b", "discord", "222"), ("c", "telegram", "333")])
+    now = time.time()
+    db.executemany("INSERT INTO messages VALUES (?,?,?)",
+                   [("a", "user", now - 600), ("b", "user", now - 60), ("b", "assistant", now),
+                    ("c", "user", now - 5)])
+    db.commit(); db.close()
     sys.path.insert(0, str(Path.home() / ".hermes/hermes-agent"))
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -92,10 +105,11 @@ def start_webhook(tmp):
         print("note: Hermes not importable, using a stand-in webhook:", err)
         server = http.server.HTTPServer(("127.0.0.1", port), StandIn)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        return port, StandIn.prompts, "stand-in (HMAC V2)"
+        return port, StandIn.prompts, "stand-in (HMAC V2)", None
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1", "port": port, "secret": SECRET,
-        "routes": {"scrawl": {"events": ["scrawl.capture"],
+        "routes": {"scrawl": {"events": ["scrawl.capture"], "script": "scrawl-follow.py",
+                              "deliver": "discord", "deliver_extra": {"chat_id": "{target_chat_id}"},
                               "prompt": (ROOT / "server" / "prompt.txt").read_text()}}}))
     prompts = []
 
@@ -113,12 +127,12 @@ def start_webhook(tmp):
     threading.Thread(target=serve, daemon=True).start()
     if not ready.wait(20):
         raise SystemExit("Hermes webhook adapter did not start")
-    return port, prompts, "Hermes WebhookAdapter"
+    return port, prompts, "Hermes WebhookAdapter", adapter
 
 
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="scrawl-hermes-test-"))
-    port, prompts, kind = start_webhook(tmp)
+    port, prompts, kind, adapter = start_webhook(tmp)
     captures, state, inbox, shim = tmp / "captures", tmp / "state", tmp / "inbox", tmp / "bin"
     captures.mkdir(); shim.mkdir()
     (tmp / "secret").write_text(SECRET)
@@ -161,6 +175,9 @@ exec python3 {RECEIVE}
     check("Hermes prompt has the server path, contact sheet and transcript",
           str(got) in text and str(got / "contact-sheet.png") in text and "overlaps the river" in text)
     check("Mac marks it sent", (state / "sent/scrawl-1792432139176-1a2b").exists())
+    if adapter is not None:
+        targets = [d.get("deliver_extra", {}).get("chat_id") for d in adapter._delivery_info.values()]
+        check("reply goes to the Discord chat used last (not Telegram, not an older one)", targets == ["222"])
 
     run()
     check("no duplicate delivery on rerun", len(prompts) == 1)

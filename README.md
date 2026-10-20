@@ -69,8 +69,10 @@ hermes config set platforms.webhook.enabled true
 hermes config set platforms.webhook.extra.host 127.0.0.1
 hermes gateway restart
 
-# Create the secret and the "scrawl" route. --deliver/--chat-id choose where replies go.
-server/setup.sh --deliver discord --chat-id <channel id>
+# Create the secret and the "scrawl" route. Pick where replies go:
+server/setup.sh --deliver discord --follow                # the chat you messaged Hermes in last
+# server/setup.sh --deliver discord --chat-id <channel id>  # or always one channel
+# server/setup.sh --deliver discord                         # or the platform's home channel
 ```
 
 `setup.sh` prints the server's SSH host key; you'll pass it to the Mac installer.
@@ -102,6 +104,14 @@ Check the link any time:
 Log: `~/Library/Application Support/scrawl-hermes/push.log`.
 Uninstall: `mac/install.sh --uninstall`, and remove the `scrawl-hermes` line from the server's
 `~/.ssh/authorized_keys`.
+
+## Where replies go
+
+With `--follow`, a route script (`server/scrawl-follow.py`, installed into Hermes's `scripts/`)
+reads Hermes's session store, read-only, and picks the channel or thread where you last sent
+Hermes a message on that platform. So a capture recorded while you're working in a project
+thread is answered in that thread. If you haven't messaged Hermes in 12 hours
+(`SCRAWL_HERMES_FOLLOW_HOURS`), or the lookup fails, the reply goes to the home channel.
 
 ## Reliability
 
